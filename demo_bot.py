@@ -11,7 +11,7 @@ from telegram.ext import (
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
 CHANNEL_IDS = {
-    "Main CP DEMO": -1004304439937,
+    "Main CP DEMO ₹299": -1004304439937,
     "Indian r##p MMS Leaked": -1004360171518,
     "Chi$#dd mms leaked video DEMO": -1004339995876,
     "Desi Cucks Bundle DEMO": -1004346101582,
