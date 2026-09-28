@@ -45,7 +45,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([InlineKeyboardButton(category, callback_data="cat_" + category)])
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        "*Welcome to get all demo videos instantly Bot!*\n\nSelect a category to watch demo videos and get full long BUY CP massage me http://t.me/Kraja8:",
+        "*Welcome to get all demo videos instantly Bot!*\n\nSelect a category to watch demo videos and get full long BUY CP massage me http://t.me/Jjanuji:",
         parse_mode="Markdown",
         reply_markup=reply_markup,
     )
@@ -82,9 +82,9 @@ async def send_category_videos(update: Update, context: ContextTypes.DEFAULT_TYP
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     if success > 0:
-        msg = "Done!\n\n" + str(success) + " demo videos sent!\n\nWant to see another category?\n\nPayment karke full access lo!\nScreenshot bhejo: @Kraja8"
+        msg = "Done!\n\n" + str(success) + " demo videos sent!\n\nWant to see another category?\n\nPayment karke full access lo!\nScreenshot bhejo: @Jjanuji"
     else:
-        msg = "No videos found.\n\nPayment karke full access lo!\nScreenshot bhejo: @Kraja8"
+        msg = "No videos found.\n\nPayment karke full access lo!\nScreenshot bhejo: @Jjanuji"
 
     await context.bot.send_message(
         chat_id=user_id,
