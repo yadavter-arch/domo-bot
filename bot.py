@@ -100,7 +100,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
     # 1) Demo screenshots (max 10 ek saath)
-    photos = sorted(glob.glob(os.path.join(DEMO_DIR, "*.jpg")) +
+    photos = sorted(glob.glob("demo*.jpg") + glob.glob("demo*.jpeg") + glob.glob("demo*.png") +
+                    glob.glob(os.path.join(DEMO_DIR, "*.jpg")) +
                     glob.glob(os.path.join(DEMO_DIR, "*.jpeg")) +
                     glob.glob(os.path.join(DEMO_DIR, "*.png")))[:10]
     if photos:
