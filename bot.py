@@ -69,6 +69,7 @@ def create_order(user_id):
         "remark1": f"tg_{user_id}",
         "remark2": "ebook",
     }, timeout=20)
+    print("gateway response:", r.status_code, r.text[:300])
     d = r.json()
     if not d.get("status"):
         raise Exception(d.get("message", "Order create nahi hua"))
