@@ -4,10 +4,10 @@ import qrcode
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-# ---------- Settings (.env / Variables) ----------
+# ---------- Settings (.env) ----------
 BOT_TOKEN      = os.environ["BOT_TOKEN"]
 GATEWAY_TOKEN  = os.environ["GATEWAY_TOKEN"]
-BOT_LINK       = os.environ.get("BOT_LINK", "https://t.me/AAPKA_BOT_USERNAME")
+BOT_LINK       = os.environ.get("BOT_LINK", "https://t.me/YOUR_BOT_USERNAME")
 PRICE          = int(os.environ.get("PRICE", "99"))
 DEFAULT_MOBILE = os.environ.get("DEFAULT_MOBILE", "9999999999")
 DATA_DIR       = os.environ.get("DATA_DIR", ".")
@@ -18,17 +18,19 @@ EBOOK_PATH     = "ebook.pdf"
 GROUP_LINK     = os.environ.get("GROUP_LINK", "")
 GROUP_CHAT_ID  = os.environ.get("GROUP_CHAT_ID", "")
 
-CREATE_URL  = "https://pay.digitalzonewala.in/api/create-order"
-STATUS_URL  = "https://pay.digitalzonewala.in/api/check-order-status"
-TIMEOUT_SEC = 30 * 60
-POLL_EVERY  = 5          # har 5 second mein payment check
+CREATE_URL   = "https://pay.digitalzonewala.in/api/create-order"
+STATUS_URL   = "https://pay.digitalzonewala.in/api/check-order-status"
+TIMEOUT_SEC  = 30 * 60
+POLL_EVERY   = 5          # auto-check payment every 5 seconds
+QR_VALID_MIN = 5
 
 DELIVERED_FILE = os.path.join(DATA_DIR, "delivered.txt")
 PENDING_FILE   = os.path.join(DATA_DIR, "pending.json")
 DEMO_CACHE     = os.path.join(DATA_DIR, "demo_cache.json")
+ORDER_LOCKS = {}
 
 
-# ---------- Chhota sa storage ----------
+# ---------- Small storage ----------
 def already_delivered(order_id):
     if not os.path.exists(DELIVERED_FILE):
         return False
@@ -50,9 +52,9 @@ def save_json(path, data):
     with open(path, "w") as f:
         json.dump(data, f)
 
-def add_pending(order_id, chat_id):
+def add_pending(order_id, chat_id, msg_id=None):
     p = load_json(PENDING_FILE, {})
-    p[order_id] = {"chat_id": chat_id, "created": time.time()}
+    p[order_id] = {"chat_id": chat_id, "created": time.time(), "msg_id": msg_id}
     save_json(PENDING_FILE, p)
 
 def remove_pending(order_id):
@@ -87,7 +89,7 @@ def check_status(order_id):
     return r.json()
 
 
-# ---------- Telegram ke andar QR ----------
+# ---------- QR inside Telegram ----------
 def make_qr_png(text):
     img = qrcode.make(text)
     bio = io.BytesIO()
@@ -104,7 +106,6 @@ def get_qr_image(pay_url):
         print("payment page error:", e)
         return None
 
-    # 1) page mein UPI link ho to usse apna QR banao
     m = re.search(r'upi://pay\?[^\s"\'<>\\]+', html)
     if m:
         return make_qr_png(m.group(0))
@@ -112,7 +113,6 @@ def get_qr_image(pay_url):
     if m:
         return make_qr_png(unquote(m.group(0)))
 
-    # 2) page mein embedded QR image (base64)
     m = re.search(r'data:image/(?:png|jpeg|jpg);base64,([A-Za-z0-9+/=]{800,})', html)
     if m:
         try:
@@ -120,7 +120,6 @@ def get_qr_image(pay_url):
         except Exception:
             pass
 
-    # 3) QR image ka link
     for src in re.findall(r'<img[^>]+src=["\']([^"\']+)', html):
         if "qr" in src.lower():
             try:
@@ -133,6 +132,25 @@ def get_qr_image(pay_url):
     imgs = re.findall(r'<img[^>]+src=["\']([^"\']{0,80})', html)[:8]
     print("QR not found. page length:", len(html), "| img src:", imgs)
     return None
+
+
+# ---------- Payment message ----------
+def payment_text(order_id, has_qr):
+    how = ("📲 Scan the QR above with any UPI app (Paytm, GPay, PhonePe...)."
+           if has_qr else
+           "📲 Tap “Pay with UPI App” below to pay with Paytm, GPay, PhonePe...")
+    return ("💳 Complete Your Payment\n\n"
+            f"💰 Amount: ₹{PRICE}\n"
+            f"🆔 Order ID: {order_id}\n\n"
+            f"How to pay:\n{how}\n\n"
+            f"⏳ Valid for {QR_VALID_MIN} minutes.\n"
+            "✅ Payment is detected automatically — you can also tap Check Payment anytime.")
+
+def pay_keyboard(order_id, pay_url):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Check Payment", callback_data=f"chk:{order_id}")],
+        [InlineKeyboardButton("💳 Pay with UPI App", url=pay_url)],
+    ])
 
 
 # ---------- Bot ----------
@@ -162,8 +180,6 @@ async def send_demo(context, chat_id):
         return
     sig = [[os.path.basename(p), os.path.getsize(p)] for p in photos]
     cache = load_json(DEMO_CACHE, {})
-
-    # Pehle se upload hui photos ki ID se turant bhejo (fast)
     if cache.get("sig") == sig and cache.get("ids"):
         try:
             await context.bot.send_media_group(
@@ -205,62 +221,88 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order_id, pay_url = await asyncio.to_thread(create_order, user_id)
     except Exception as e:
         print("create_order error:", e)
-        await context.bot.send_message(chat_id, "⚠️ Could not create the order right now. Please try again in a moment.")
+        await context.bot.send_message(
+            chat_id, "⚠️ Could not create the order right now. Please try again in a moment.")
         return
 
-    add_pending(order_id, chat_id)
+    qr = await asyncio.to_thread(get_qr_image, pay_url)
+    kb = pay_keyboard(order_id, pay_url)
+    if qr:
+        msg = await context.bot.send_photo(
+            chat_id, qr, caption=payment_text(order_id, True), reply_markup=kb)
+    else:
+        msg = await context.bot.send_message(
+            chat_id, payment_text(order_id, False), reply_markup=kb)
+
+    add_pending(order_id, chat_id, msg.message_id)
     schedule_poll(context.job_queue, order_id, chat_id, time.time())
 
-    buttons = InlineKeyboardMarkup([[InlineKeyboardButton("💳 Pay with UPI App", url=pay_url)]])
-    qr = await asyncio.to_thread(get_qr_image, pay_url)
-    if qr:
-        await context.bot.send_photo(
-            chat_id, qr,
-            caption=(f"✅ Order created. Price: ₹{PRICE}\n\n"
-                     "📲 Scan this QR from another phone to pay, "
-                     "or tap the button below to pay with your UPI app.\n"
-                     "You will get access right here as soon as the payment is done. (Valid for 5 minutes)"),
-            reply_markup=buttons)
-    else:
-        await context.bot.send_message(
-            chat_id,
-            f"✅ Order created. Price: ₹{PRICE}\n\n"
-            "Tap the button below to pay. You will get access right here as soon as the payment is done.",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("💳 Pay Now", url=pay_url)]]))
+async def process_order(context, order_id, chat_id):
+    """Checks the gateway once. Returns: paid / already / pending / error."""
+    lock = ORDER_LOCKS.setdefault(order_id, asyncio.Lock())
+    async with lock:
+        if already_delivered(order_id):
+            return "already"
+        try:
+            d = await asyncio.to_thread(check_status, order_id)
+        except Exception as e:
+            print("status error:", e)
+            return "error"
+
+        result = d.get("result") or {}
+        try:
+            amount_ok = float(result.get("amount", 0)) == float(PRICE)
+        except (TypeError, ValueError):
+            amount_ok = False
+
+        if d.get("status") == "COMPLETED" and result.get("status") == "SUCCESS" and amount_ok:
+            mark_delivered(order_id)
+            info = load_json(PENDING_FILE, {}).get(order_id, {})
+            remove_pending(order_id)
+            await deliver(context, chat_id)
+            if info.get("msg_id"):
+                try:
+                    await context.bot.delete_message(chat_id, info["msg_id"])
+                except Exception as e:
+                    print("delete message error:", e)
+            return "paid"
+        return "pending"
 
 async def poll(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
     order_id = job.data["order_id"]
     chat_id = job.data["chat_id"]
 
-    if already_delivered(order_id):
-        remove_pending(order_id)
-        job.schedule_removal()
-        return
-
     if time.time() - job.data["created"] > TIMEOUT_SEC + 60:
         remove_pending(order_id)
         job.schedule_removal()
         return
 
-    try:
-        d = await asyncio.to_thread(check_status, order_id)
-    except Exception as e:
-        print("status error:", e)
+    status = await process_order(context, order_id, chat_id)
+    if status in ("paid", "already"):
+        job.schedule_removal()
+
+async def check_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    order_id = q.data.split(":", 1)[1]
+    chat_id = q.message.chat_id
+
+    if already_delivered(order_id):
+        await q.answer("Payment already received ✅", show_alert=True)
+        return
+    info = load_json(PENDING_FILE, {}).get(order_id)
+    if info is None or info.get("chat_id") != chat_id:
+        await q.answer("This order has expired. Send /start to begin again.", show_alert=True)
         return
 
-    result = d.get("result") or {}
-    try:
-        amount_ok = float(result.get("amount", 0)) == float(PRICE)
-    except (TypeError, ValueError):
-        amount_ok = False
-
-    if d.get("status") == "COMPLETED" and result.get("status") == "SUCCESS" and amount_ok:
-        mark_delivered(order_id)
-        remove_pending(order_id)
-        job.schedule_removal()
-        await deliver(context, chat_id)
+    status = await process_order(context, order_id, chat_id)
+    if status == "paid":
+        await q.answer("Payment received ✅", show_alert=True)
+    elif status == "already":
+        await q.answer("Payment already received ✅", show_alert=True)
+    else:
+        await q.answer("Payment not received yet. Please complete the payment and tap again.",
+                       show_alert=True)
 
 async def deliver(context, chat_id):
     link = GROUP_LINK
@@ -289,7 +331,12 @@ async def on_startup(application: Application):
             schedule_poll(application.job_queue, order_id, info["chat_id"], info["created"])
     print("Bot started.")
 
-app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CallbackQueryHandler(buy, pattern="^buy$"))
-app.run_polling()
+def main():
+    app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(buy, pattern="^buy$"))
+    app.add_handler(CallbackQueryHandler(check_payment, pattern="^chk:"))
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
