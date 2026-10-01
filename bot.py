@@ -1,8 +1,15 @@
-import os, io, re, json, time, glob, base64, asyncio, requests
+import os, io, re, json, time, glob, base64, socket, asyncio, requests
 from urllib.parse import unquote, urljoin
 import qrcode
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+import urllib3.util.connection as urllib3_cn
+
+# Force IPv4 (avoids slow IPv6 fallback; our whitelisted IP is IPv4)
+if os.environ.get("FORCE_IPV4", "1") == "1":
+    urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
+
+HTTP = requests.Session()   # keeps connections open = faster repeat calls
 
 # ---------- Settings (.env) ----------
 BOT_TOKEN      = os.environ["BOT_TOKEN"]
@@ -66,7 +73,7 @@ def remove_pending(order_id):
 # ---------- Gateway API ----------
 def create_order(user_id):
     order_id = f"{user_id}{int(time.time())}"
-    r = requests.post(CREATE_URL, data={
+    r = HTTP.post(CREATE_URL, data={
         "customer_mobile": DEFAULT_MOBILE,
         "user_token": GATEWAY_TOKEN,
         "amount": str(PRICE),
@@ -74,7 +81,7 @@ def create_order(user_id):
         "redirect_url": BOT_LINK,
         "remark1": f"tg_{user_id}",
         "remark2": "ebook",
-    }, timeout=20)
+    }, timeout=15)
     print("gateway response:", r.status_code, r.text[:200])
     d = r.json()
     if not d.get("status"):
@@ -82,10 +89,10 @@ def create_order(user_id):
     return order_id, d["result"]["payment_url"]
 
 def check_status(order_id):
-    r = requests.post(STATUS_URL, data={
+    r = HTTP.post(STATUS_URL, data={
         "user_token": GATEWAY_TOKEN,
         "order_id": order_id,
-    }, timeout=20)
+    }, timeout=10)
     return r.json()
 
 
@@ -100,7 +107,7 @@ def make_qr_png(text):
 def get_qr_image(pay_url):
     """Extracts the QR from the gateway payment page. Returns None if not found."""
     try:
-        r = requests.get(pay_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        r = HTTP.get(pay_url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
         html = r.text.replace("&amp;", "&").replace("\\/", "/")
     except Exception as e:
         print("payment page error:", e)
@@ -123,7 +130,7 @@ def get_qr_image(pay_url):
     for src in re.findall(r'<img[^>]+src=["\']([^"\']+)', html):
         if "qr" in src.lower():
             try:
-                ir = requests.get(urljoin(pay_url, src), timeout=15)
+                ir = HTTP.get(urljoin(pay_url, src), timeout=8)
                 if ir.ok and ir.headers.get("content-type", "").startswith("image"):
                     return io.BytesIO(ir.content)
             except Exception:
@@ -214,18 +221,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer("Creating your order...")
+    await q.answer()
     user_id = q.from_user.id
     chat_id = q.message.chat_id
+
+    # Instant feedback so the user knows something is happening
+    wait_msg = await context.bot.send_message(chat_id, "⏳ Creating your order, please wait...")
+
+    t0 = time.time()
     try:
         order_id, pay_url = await asyncio.to_thread(create_order, user_id)
     except Exception as e:
         print("create_order error:", e)
-        await context.bot.send_message(
-            chat_id, "⚠️ Could not create the order right now. Please try again in a moment.")
+        await wait_msg.edit_text(
+            "⚠️ Could not create the order right now. Please try again in a moment.")
         return
+    t1 = time.time()
 
     qr = await asyncio.to_thread(get_qr_image, pay_url)
+    t2 = time.time()
+
     kb = pay_keyboard(order_id, pay_url)
     if qr:
         msg = await context.bot.send_photo(
@@ -233,9 +248,15 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         msg = await context.bot.send_message(
             chat_id, payment_text(order_id, False), reply_markup=kb)
+    t3 = time.time()
 
     add_pending(order_id, chat_id, msg.message_id)
     schedule_poll(context.job_queue, order_id, chat_id, time.time())
+    try:
+        await wait_msg.delete()
+    except Exception:
+        pass
+    print(f"timing: create_order={t1-t0:.1f}s qr={t2-t1:.1f}s telegram_send={t3-t2:.1f}s")
 
 async def process_order(context, order_id, chat_id):
     """Checks the gateway once. Returns: paid / already / pending / error."""
