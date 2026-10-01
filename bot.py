@@ -76,7 +76,7 @@ def create_order(user_id):
     print("gateway response:", r.status_code, r.text[:200])
     d = r.json()
     if not d.get("status"):
-        raise Exception(d.get("message", "Order create nahi hua"))
+        raise Exception(d.get("message", "Order creation failed"))
     return order_id, d["result"]["payment_url"]
 
 def check_status(order_id):
@@ -96,7 +96,7 @@ def make_qr_png(text):
     return bio
 
 def get_qr_image(pay_url):
-    """Gateway ke payment page se QR nikalta hai. Nahi mila to None."""
+    """Extracts the QR from the gateway payment page. Returns None if not found."""
     try:
         r = requests.get(pay_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
         html = r.text.replace("&amp;", "&").replace("\\/", "/")
@@ -131,7 +131,7 @@ def get_qr_image(pay_url):
                 pass
 
     imgs = re.findall(r'<img[^>]+src=["\']([^"\']{0,80})', html)[:8]
-    print("QR nahi mila. page length:", len(html), "| img src:", imgs)
+    print("QR not found. page length:", len(html), "| img src:", imgs)
     return None
 
 
@@ -147,7 +147,7 @@ def welcome_text():
     if os.path.exists(WELCOME_FILE):
         with open(WELCOME_FILE, encoding="utf-8") as f:
             return f.read().strip()
-    return f"📚 Demo neeche dekhein.\n\nKeemat: ₹{PRICE}"
+    return f"📚 Check out the demo above.\n\nPrice: ₹{PRICE}"
 
 def demo_photos():
     files = []
@@ -198,34 +198,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer("Order ban raha hai...")
+    await q.answer("Creating your order...")
     user_id = q.from_user.id
     chat_id = q.message.chat_id
     try:
         order_id, pay_url = await asyncio.to_thread(create_order, user_id)
     except Exception as e:
         print("create_order error:", e)
-        await context.bot.send_message(chat_id, "⚠️ Abhi order nahi ban paya, thodi der baad try karein.")
+        await context.bot.send_message(chat_id, "⚠️ Could not create the order right now. Please try again in a moment.")
         return
 
     add_pending(order_id, chat_id)
     schedule_poll(context.job_queue, order_id, chat_id, time.time())
 
-    buttons = InlineKeyboardMarkup([[InlineKeyboardButton("💳 UPI App se Pay karein", url=pay_url)]])
+    buttons = InlineKeyboardMarkup([[InlineKeyboardButton("💳 Pay with UPI App", url=pay_url)]])
     qr = await asyncio.to_thread(get_qr_image, pay_url)
     if qr:
         await context.bot.send_photo(
             chat_id, qr,
-            caption=(f"✅ Order ban gaya. Keemat: ₹{PRICE}\n\n"
-                     "📲 Ye QR kisi doosre phone se scan karke pay karein, "
-                     "ya neeche button dabakar apne UPI app se pay karein.\n"
-                     "Payment hote hi access yahin mil jayega. (5 minute mein valid)"),
+            caption=(f"✅ Order created. Price: ₹{PRICE}\n\n"
+                     "📲 Scan this QR from another phone to pay, "
+                     "or tap the button below to pay with your UPI app.\n"
+                     "You will get access right here as soon as the payment is done. (Valid for 5 minutes)"),
             reply_markup=buttons)
     else:
         await context.bot.send_message(
             chat_id,
-            f"✅ Order ban gaya. Keemat: ₹{PRICE}\n\n"
-            "Neeche button se payment karein. Payment hote hi access yahin mil jayega.",
+            f"✅ Order created. Price: ₹{PRICE}\n\n"
+            "Tap the button below to pay. You will get access right here as soon as the payment is done.",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("💳 Pay Now", url=pay_url)]]))
 
@@ -276,18 +276,18 @@ async def deliver(context, chat_id):
     if link:
         await context.bot.send_message(
             chat_id,
-            "🎉 Payment mil gaya! Neeche link se group join karein:\n\n"
-            f"{link}\n\nDhanyavaad!")
+            "🎉 Payment received! Join the group using the link below:\n\n"
+            f"{link}\n\nThank you!")
 
     if os.path.exists(EBOOK_PATH):
         with open(EBOOK_PATH, "rb") as f:
-            await context.bot.send_document(chat_id, f, caption="📚 Ye rahi aapki ebook.")
+            await context.bot.send_document(chat_id, f, caption="📚 Here is your ebook.")
 
 async def on_startup(application: Application):
     for order_id, info in load_json(PENDING_FILE, {}).items():
         if time.time() - info["created"] < TIMEOUT_SEC + 60:
             schedule_poll(application.job_queue, order_id, info["chat_id"], info["created"])
-    print("Bot chalu ho gaya.")
+    print("Bot started.")
 
 app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
 app.add_handler(CommandHandler("start", start))
