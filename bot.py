@@ -1,7 +1,9 @@
 import os, io, re, json, time, glob, base64, socket, asyncio, requests
+from datetime import datetime, timezone, timedelta
 from urllib.parse import unquote, urljoin
 import qrcode
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram.error import Forbidden
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 import urllib3.util.connection as urllib3_cn
 
@@ -25,6 +27,14 @@ EBOOK_PATH     = "ebook.pdf"
 GROUP_LINK     = os.environ.get("GROUP_LINK", "")
 GROUP_CHAT_ID  = os.environ.get("GROUP_CHAT_ID", "")
 
+# Support + reminders
+SUPPORT_USERNAME = os.environ.get("SUPPORT_USERNAME", "Jjanuji").lstrip("@")
+REMINDER_HOURS   = float(os.environ.get("REMINDER_HOURS", "2"))   # gap between reminders
+MAX_REMINDERS    = int(os.environ.get("MAX_REMINDERS", "3"))      # max reminders per user
+SEND_FROM_HOUR   = int(os.environ.get("SEND_FROM_HOUR", "9"))     # India time, no night messages
+SEND_TO_HOUR     = int(os.environ.get("SEND_TO_HOUR", "22"))
+IST = timezone(timedelta(hours=5, minutes=30))
+
 CREATE_URL   = "https://pay.digitalzonewala.in/api/create-order"
 STATUS_URL   = "https://pay.digitalzonewala.in/api/check-order-status"
 TIMEOUT_SEC  = 30 * 60
@@ -34,6 +44,7 @@ QR_VALID_MIN = 5
 DELIVERED_FILE = os.path.join(DATA_DIR, "delivered.txt")
 PENDING_FILE   = os.path.join(DATA_DIR, "pending.json")
 DEMO_CACHE     = os.path.join(DATA_DIR, "demo_cache.json")
+USERS_FILE     = os.path.join(DATA_DIR, "users.json")
 ORDER_LOCKS = {}
 
 
@@ -68,6 +79,34 @@ def remove_pending(order_id):
     p = load_json(PENDING_FILE, {})
     p.pop(order_id, None)
     save_json(PENDING_FILE, p)
+
+
+# ---------- Users (for reminders) ----------
+def update_user(chat_id, **fields):
+    users = load_json(USERS_FILE, {})
+    rec = users.get(str(chat_id), {"reminders_sent": 0, "paid": False,
+                                    "muted": False, "blocked": False})
+    rec.update(fields)
+    users[str(chat_id)] = rec
+    save_json(USERS_FILE, users)
+
+def get_user(chat_id):
+    return load_json(USERS_FILE, {}).get(str(chat_id))
+
+def touch_user(chat_id, returning=False):
+    """Records activity. returning=True (user pressed /start) resets the reminder count."""
+    fields = {"last_activity": time.time()}
+    if returning:
+        fields.update(reminders_sent=0, blocked=False)
+    update_user(chat_id, **fields)
+
+
+# ---------- Support text ----------
+def support_line():
+    return f"💬 Need help? Contact @{SUPPORT_USERNAME}"
+
+def support_button():
+    return InlineKeyboardButton("💬 Support", url=f"https://t.me/{SUPPORT_USERNAME}")
 
 
 # ---------- Gateway API ----------
@@ -151,12 +190,14 @@ def payment_text(order_id, has_qr):
             f"🆔 Order ID: {order_id}\n\n"
             f"How to pay:\n{how}\n\n"
             f"⏳ Valid for {QR_VALID_MIN} minutes.\n"
-            "✅ Payment is detected automatically — you can also tap Check Payment anytime.")
+            "✅ Payment is detected automatically — you can also tap Check Payment anytime.\n\n"
+            f"Paid but didn't get the link? Contact @{SUPPORT_USERNAME} with your Order ID.")
 
 def pay_keyboard(order_id, pay_url):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Check Payment", callback_data=f"chk:{order_id}")],
         [InlineKeyboardButton("💳 Pay with UPI App", url=pay_url)],
+        [support_button()],
     ])
 
 
@@ -171,8 +212,10 @@ def schedule_poll(job_queue, order_id, chat_id, created):
 def welcome_text():
     if os.path.exists(WELCOME_FILE):
         with open(WELCOME_FILE, encoding="utf-8") as f:
-            return f.read().strip()
-    return f"📚 Check out the demo above.\n\nPrice: ₹{PRICE}"
+            base = f.read().strip()
+    else:
+        base = f"📚 Check out the demo above.\n\nPrice: ₹{PRICE}"
+    return base + "\n\n" + support_line()
 
 def demo_photos():
     files = []
@@ -206,24 +249,45 @@ async def send_demo(context, chat_id):
         for f in files:
             f.close()
 
+def buy_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"💳 Buy Now ₹{PRICE}", callback_data="buy")],
+        [support_button()],
+    ])
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    touch_user(chat_id, returning=True)
     await send_demo(context, chat_id)
 
     if os.path.exists(DEMO_PDF):
         with open(DEMO_PDF, "rb") as f:
             await context.bot.send_document(chat_id, f, caption="📖 Free demo (sample pages)")
 
-    await context.bot.send_message(
-        chat_id, welcome_text(),
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton(f"💳 Buy Now ₹{PRICE}", callback_data="buy")]]))
+    await context.bot.send_message(chat_id, welcome_text(), reply_markup=buy_keyboard())
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"{support_line()}\n\n"
+        "If you already paid but did not receive the group link, "
+        f"message @{SUPPORT_USERNAME} with your Order ID and a payment screenshot.\n\n"
+        "Send /start to see the demo and buy.")
+
+async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    update_user(update.effective_chat.id, muted=True)
+    await update.message.reply_text("🔕 Reminders turned off. Send /start anytime to see the offer again.")
+
+async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    update_user(q.message.chat_id, muted=True)
+    await q.answer("🔕 Reminders turned off.", show_alert=True)
 
 async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     user_id = q.from_user.id
     chat_id = q.message.chat_id
+    touch_user(chat_id)
 
     # Instant feedback so the user knows something is happening
     wait_msg = await context.bot.send_message(chat_id, "⏳ Creating your order, please wait...")
@@ -234,7 +298,8 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print("create_order error:", e)
         await wait_msg.edit_text(
-            "⚠️ Could not create the order right now. Please try again in a moment.")
+            "⚠️ Could not create the order right now. Please try again in a moment.\n\n"
+            + support_line())
         return
     t1 = time.time()
 
@@ -278,6 +343,7 @@ async def process_order(context, order_id, chat_id):
 
         if d.get("status") == "COMPLETED" and result.get("status") == "SUCCESS" and amount_ok:
             mark_delivered(order_id)
+            update_user(chat_id, paid=True)          # no more reminders for this user
             info = load_json(PENDING_FILE, {}).get(order_id, {})
             remove_pending(order_id)
             await deliver(context, chat_id)
@@ -313,7 +379,8 @@ async def check_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     info = load_json(PENDING_FILE, {}).get(order_id)
     if info is None or info.get("chat_id") != chat_id:
-        await q.answer("This order has expired. Send /start to begin again.", show_alert=True)
+        await q.answer(f"This order has expired. If you already paid, contact @{SUPPORT_USERNAME} "
+                       "with your Order ID. Otherwise send /start.", show_alert=True)
         return
 
     status = await process_order(context, order_id, chat_id)
@@ -340,22 +407,76 @@ async def deliver(context, chat_id):
         await context.bot.send_message(
             chat_id,
             "🎉 Payment received! Join the group using the link below:\n\n"
-            f"{link}\n\nThank you!")
+            f"{link}\n\nThank you!\n\n"
+            f"Any problem with the link? Contact @{SUPPORT_USERNAME}")
 
     if os.path.exists(EBOOK_PATH):
         with open(EBOOK_PATH, "rb") as f:
             await context.bot.send_document(chat_id, f, caption="📚 Here is your ebook.")
 
+
+# ---------- Reminders ----------
+def now_hour():
+    return datetime.now(IST).hour
+
+def reminder_text():
+    return ("⏰ Reminder\n\n"
+            "You didn't complete your payment. 😔\n"
+            "Try again to get access — tap Buy Now below! 👇\n\n"
+            + support_line())
+
+def reminder_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🛒 Buy Now ₹{PRICE}", callback_data="buy")],
+        [support_button()],
+        [InlineKeyboardButton("🔕 Stop reminders", callback_data="mute")],
+    ])
+
+async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    """Runs every 10 minutes. Sends reminders only to users who have not paid."""
+    if not (SEND_FROM_HOUR <= now_hour() < SEND_TO_HOUR):
+        return                                   # no messages at night (India time)
+    now = time.time()
+    for key in list(load_json(USERS_FILE, {}).keys()):
+        rec = get_user(key) or {}
+        if rec.get("paid") or rec.get("muted") or rec.get("blocked"):
+            continue
+        if rec.get("reminders_sent", 0) >= MAX_REMINDERS:
+            continue
+        last = max(rec.get("last_activity", 0), rec.get("last_reminder", 0))
+        if now - last < REMINDER_HOURS * 3600:
+            continue
+        chat_id = int(key)
+        pending = load_json(PENDING_FILE, {})
+        if any(i.get("chat_id") == chat_id and now - i["created"] < TIMEOUT_SEC
+               for i in pending.values()):
+            continue                             # user is in the middle of paying
+        try:
+            await context.bot.send_message(
+                chat_id, reminder_text(), reply_markup=reminder_keyboard())
+            update_user(chat_id, reminders_sent=rec.get("reminders_sent", 0) + 1,
+                        last_reminder=now)
+        except Forbidden:
+            update_user(chat_id, blocked=True)   # user blocked the bot
+        except Exception as e:
+            print("reminder error:", chat_id, e)
+        await asyncio.sleep(0.1)                 # stay well under Telegram rate limits
+
+
 async def on_startup(application: Application):
     for order_id, info in load_json(PENDING_FILE, {}).items():
         if time.time() - info["created"] < TIMEOUT_SEC + 60:
             schedule_poll(application.job_queue, order_id, info["chat_id"], info["created"])
+    application.job_queue.run_repeating(reminder_job, interval=600, first=60)
     print("Bot started.")
 
 def main():
     app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CallbackQueryHandler(buy, pattern="^buy$"))
+    app.add_handler(CallbackQueryHandler(mute, pattern="^mute$"))
     app.add_handler(CallbackQueryHandler(check_payment, pattern="^chk:"))
     app.run_polling()
 
