@@ -1,4 +1,6 @@
 delivered.txt
 pending.json
+demo_cache.json
+users.json
 .env
 __pycache__/
